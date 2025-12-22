@@ -25,7 +25,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 try:
     from exchange_config import (
         ex, python_command, renewal, printerror, get_time, 
-        emergency_convert_list, append_new_line
+        emergency_convert_list, append_new_line, rebalance_to_quote_currency,
+        detect_and_convert_leftover_crypto, AUTO_REBALANCE_ON_EXIT
     )
 except ImportError as e:
     print(f"Error importing exchange_config: {e}")
@@ -137,9 +138,15 @@ def run_bot(mode: str, pair: str, balance: str, renewal_time: str, exchange_list
         return 1
     
     try:
+        # Generate session title based on mode and pair
+        if mode == "fake-money":
+            session_title = f"Fake-Money-{pair.replace('/', '')}"
+        else:
+            session_title = f"Real-{pair.replace('/', '')}"
+        
         process = subprocess.run([
             python_command, bot_file, pair, balance, 
-            renewal_time, pair, exchange_list
+            renewal_time, session_title, exchange_list
         ])
         return process.returncode
     except Exception as e:
@@ -319,6 +326,14 @@ def main():
             
             print(f"{get_time()}Starting session #{session_count}")
             
+            # Before starting a new session (except the first one), check for leftover crypto
+            if session_count > 1 and mode == 'real':
+                print(f"{get_time()}Checking for leftover cryptocurrency from previous session...")
+                quote_currency = pair.split('/')[1]
+                detect_and_convert_leftover_crypto(exchanges, pair, quote_currency)
+                import time
+                time.sleep(2)  # Wait for conversions
+            
             return_code = run_bot(mode, pair, current_balance, renewal_time, exchanges_str)
             
             if return_code != 0:
@@ -329,6 +344,16 @@ def main():
             if not renewal or int(renewal_time) >= DEFAULT_RENEWAL_MINUTES:
                 print(f"{get_time()}Session completed. Exiting (no renewal).")
                 break
+            
+            # If renewal is enabled, rebalance before next session
+            # Note: Entry price tracking is per-session, so we use 0.0 here
+            # The bot.py session end rebalancing will have already handled this with proper entry price
+            if mode == 'real' and AUTO_REBALANCE_ON_EXIT:
+                print(f"{get_time()}Rebalancing before next session...")
+                # Use 0.0 for entry price since we're between sessions (already rebalanced at end)
+                rebalance_to_quote_currency(pair, exchanges, 0.0, force=False)
+                import time
+                time.sleep(2)  # Wait for rebalancing
             
             # If renewal is enabled, continue the loop for next session
             print(f"{get_time()}Session #{session_count} completed. Restarting in 5 seconds...")

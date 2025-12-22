@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Barbotine Arbitrage Bot - Fake Money Mode
-Simulates arbitrage trading with fake money for testing and demonstration.
+Barbotine Arbitrage Bot - Real Money Mode
+Executes real arbitrage trades with actual funds on cryptocurrency exchanges.
+⚠️  WARNING: This bot trades with real money. Use at your own risk.
 """
 
 import asyncio
@@ -20,20 +21,20 @@ init()
 
 # Import configuration
 from exchange_config import (
-    ex, python_command, first_orders_fill_timeout, demo_fake_delay, 
-    demo_fake_delay_ms, criteria_pct, criteria_usd, printerror, 
-    get_time, get_time_blank, append_new_line, append_list_to_file,
+    ex, python_command, first_orders_fill_timeout, criteria_pct, criteria_usd, 
+    printerror, get_time, get_time_blank, append_new_line, append_list_to_file,
     printandtelegram, calculate_average, send_to_telegram, get_balance,
-    emergency_convert_list, MIN_ORDER_VALUE_USD, AUTO_REBALANCE_ON_EXIT,
-    REBALANCE_LOSS_THRESHOLD, ORDERBOOK_FETCH_DELAY, BALANCE_CACHE_TTL,
-    MIN_ITERATION_DELAY, RATE_LIMIT_BACKOFF_BASE, MAX_RATE_LIMIT_BACKOFF,
-    DEFAULT_TARGET_INVESTMENT_USD, OPPORTUNITY_LOG_THROTTLE, OPPORTUNITY_LOG_DEDUPE,
-    calculate_optimal_order_size, DYNAMIC_ORDER_SIZING
+    emergency_convert_list, get_balance_usdt, cancel_all_orders, MIN_ORDER_VALUE_USD,
+    detect_and_convert_leftover_crypto, rebalance_to_quote_currency,
+    check_balance_distribution, should_rebalance_balances, AUTO_REBALANCE_ON_EXIT,
+    ORDERBOOK_FETCH_DELAY, BALANCE_CACHE_TTL, MIN_ITERATION_DELAY,
+    RATE_LIMIT_BACKOFF_BASE, MAX_RATE_LIMIT_BACKOFF, DEFAULT_TARGET_INVESTMENT_USD,
+    OPPORTUNITY_LOG_THROTTLE, OPPORTUNITY_LOG_DEDUPE, calculate_optimal_order_size,
+    DYNAMIC_ORDER_SIZING
 )
 
 # Constants
 REQUIRED_ARGS = 6
-# MIN_ORDER_VALUE_USD is imported from exchange_config
 DEFAULT_TIMEOUT_SECONDS = 3600
 CONSOLE_CLEAR_LINES = 2
 
@@ -81,7 +82,7 @@ def validate_arguments() -> None:
     """Validate command line arguments."""
     if len(sys.argv) != REQUIRED_ARGS:
         print(f"\nIncorrect usage. Expected format:")
-        print(f"{python_command} bot-fake-money.py [pair] [total_usdt_investment] [timeout_minutes] [session_title] [exchange_list]")
+        print(f"{python_command} bot.py [pair] [total_usdt_investment] [timeout_minutes] [session_title] [exchange_list]")
         print(f"\nReceived arguments: {sys.argv}")
         sys.exit(1)
 
@@ -301,89 +302,176 @@ def format_exchange_balances(
     
     return "\n".join(balance_lines)
 
-def simulate_order_delay(min_ask_exchange: str, max_bid_exchange: str, pair: str) -> tuple:
-    """Simulate network delay and return updated prices."""
-    if not demo_fake_delay:
-        return None, None
-    
-    asyncio.run(asyncio.sleep(demo_fake_delay_ms / 1000))
-    
-    try:
-        # Use existing exchange instances from ex dict if available, otherwise create new ones
-        min_ask_ex = ex.get(min_ask_exchange) or getattr(ccxt, min_ask_exchange)({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
-        max_bid_ex = ex.get(max_bid_exchange) or getattr(ccxt, max_bid_exchange)({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
-        
-        # Fetch orderbook synchronously (not using watch_order_book)
-        min_ask_ob = min_ask_ex.fetch_order_book(pair)
-        max_bid_ob = max_bid_ex.fetch_order_book(pair)
-        
-        if min_ask_ob and max_bid_ob and min_ask_ob.get('asks') and max_bid_ob.get('bids'):
-            return min_ask_ob['asks'][0][0], max_bid_ob['bids'][0][0]
-    except Exception as e:
-        printerror(m=f"Error in delay simulation: {e}")
-    
-    return None, None
-
-def execute_simulated_trades(
+def execute_real_trades(
     min_ask_exchange: str,
     max_bid_exchange: str, 
     min_ask_price: float,
     max_bid_price: float,
     crypto_per_transaction: float,
     profit_usd: float,
-    crypto_balances: Dict[str, float],
-    usd_balances: Dict[str, float],
-    fees: Dict[str, Dict[str, float]],
+    pair: str,
     base_currency: str,
+    fees: Dict[str, Dict[str, float]],
     state: TradingState = None
-) -> None:
-    """Execute simulated arbitrage trades and update balances."""
+) -> bool:
+    """Execute real arbitrage trades on exchanges."""
     
-    # Log the trades
-    printandtelegram(f"{get_time()}Sell market order filled on {max_bid_exchange} "
-                    f"for {crypto_per_transaction:.6f} {base_currency} at {max_bid_price}")
-    printandtelegram(f"{get_time()}Buy market order filled on {min_ask_exchange} "
-                    f"for {crypto_per_transaction:.6f} {base_currency} at {min_ask_price}")
-    
-    # Record the profit
-    append_list_to_file('all_opportunities_profits.txt', profit_usd)
-    
-    # Update balances
-    # Get fee rates
-    buy_fee_rate = fees[min_ask_exchange].get('base', 0) + fees[min_ask_exchange].get('quote', 0)
-    sell_fee_rate = fees[max_bid_exchange].get('base', 0) + fees[max_bid_exchange].get('quote', 0)
-    
-    # Buy on min_ask exchange
-    crypto_balances[min_ask_exchange] += crypto_per_transaction
-    buy_cost = crypto_per_transaction * min_ask_price * (1 + buy_fee_rate)
-    usd_balances[min_ask_exchange] -= buy_cost
-    
-    # Sell on max_bid exchange
-    crypto_balances[max_bid_exchange] -= crypto_per_transaction
-    sell_proceeds = crypto_per_transaction * max_bid_price * (1 - sell_fee_rate)
-    usd_balances[max_bid_exchange] += sell_proceeds
-    
-    # Update entry price tracking (weighted average)
-    # This tracks the average cost basis for rebalancing decisions
-    if state is not None:
-        cost_of_this_buy = crypto_per_transaction * min_ask_price
-        state.total_cost_basis += cost_of_this_buy
-        state.total_crypto_bought += crypto_per_transaction
-        if state.total_crypto_bought > 0:
-            state.average_entry_price = state.total_cost_basis / state.total_crypto_bought
+    try:
+        # Get market info for order size validation
+        min_ask_markets = ex[min_ask_exchange].load_markets()
+        max_bid_markets = ex[max_bid_exchange].load_markets()
+        
+        min_ask_market = min_ask_markets.get(pair, {})
+        max_bid_market = max_bid_markets.get(pair, {})
+        
+        # Get trading limits
+        min_ask_limits = min_ask_market.get('limits', {})
+        max_bid_limits = max_bid_market.get('limits', {})
+        
+        min_amount_ask = min_ask_limits.get('amount', {}).get('min', 0)
+        min_amount_bid = max_bid_limits.get('amount', {}).get('min', 0)
+        min_cost_ask = min_ask_limits.get('cost', {}).get('min', 0)
+        min_cost_bid = max_bid_limits.get('cost', {}).get('min', 0)
+        
+        # Validate order sizes
+        buy_cost = crypto_per_transaction * min_ask_price
+        sell_cost = crypto_per_transaction * max_bid_price
+        
+        if (crypto_per_transaction < max(min_amount_ask, min_amount_bid) or
+            buy_cost < max(min_cost_ask, MIN_ORDER_VALUE_USD) or
+            sell_cost < max(min_cost_bid, MIN_ORDER_VALUE_USD)):
+            printerror(m=f"Order size too small for {pair} on exchanges")
+            return False
+        
+        # Place sell order first (on max_bid exchange) - we need to have crypto to sell
+        printandtelegram(f"{get_time()}Placing SELL market order on {max_bid_exchange}: "
+                        f"{crypto_per_transaction:.6f} {base_currency} at ~{max_bid_price}")
+        
+        # Use createOrder with market type for better compatibility
+        sell_order = ex[max_bid_exchange].create_order(
+            pair,
+            'market',
+            'sell',
+            crypto_per_transaction
+        )
+        
+        if not sell_order:
+            printerror(m=f"Failed to place sell order on {max_bid_exchange}")
+            return False
+        
+        sell_order_id = sell_order.get('id') or sell_order.get('orderId')
+        printandtelegram(f"{get_time()}Sell order placed on {max_bid_exchange}, order ID: {sell_order_id}")
+        
+        # Wait for sell order to fill
+        sell_filled = False
+        sell_fill_time = time.time()
+        while time.time() - sell_fill_time < 30:  # 30 second timeout
+            try:
+                order_status = ex[max_bid_exchange].fetch_order(sell_order_id, pair)
+                if order_status['status'] == 'closed' or order_status['filled'] > 0:
+                    sell_filled = True
+                    actual_sell_amount = order_status.get('filled', crypto_per_transaction)
+                    actual_sell_price = order_status.get('average', max_bid_price)
+                    printandtelegram(f"{get_time()}Sell order filled on {max_bid_exchange}: "
+                                    f"{actual_sell_amount:.6f} {base_currency} at {actual_sell_price}")
+                    break
+                time.sleep(0.5)
+            except Exception as e:
+                printerror(m=f"Error checking sell order status: {e}")
+                time.sleep(1)
+        
+        if not sell_filled:
+            printerror(m=f"Sell order on {max_bid_exchange} did not fill in time")
+            # Try to cancel the order
+            try:
+                ex[max_bid_exchange].cancel_order(sell_order_id, pair)
+            except:
+                pass
+            return False
+        
+        # Get the actual amount received from the sell
+        try:
+            sell_order_final = ex[max_bid_exchange].fetch_order(sell_order_id, pair)
+            quote_received = sell_order_final.get('cost', crypto_per_transaction * max_bid_price)
+        except:
+            quote_received = crypto_per_transaction * max_bid_price
+        
+        # Calculate how much crypto we can buy with the proceeds
+        buy_amount = quote_received / min_ask_price
+        
+        # Place buy order (on min_ask exchange)
+        printandtelegram(f"{get_time()}Placing BUY market order on {min_ask_exchange}: "
+                        f"{buy_amount:.6f} {base_currency} at ~{min_ask_price}")
+        
+        # Use createOrder with market type for better compatibility
+        buy_order = ex[min_ask_exchange].create_order(
+            pair,
+            'market',
+            'buy',
+            buy_amount
+        )
+        
+        if not buy_order:
+            printerror(m=f"Failed to place buy order on {min_ask_exchange}")
+            return False
+        
+        buy_order_id = buy_order.get('id') or buy_order.get('orderId')
+        printandtelegram(f"{get_time()}Buy order placed on {min_ask_exchange}, order ID: {buy_order_id}")
+        
+        # Wait for buy order to fill
+        buy_filled = False
+        buy_fill_time = time.time()
+        actual_buy_price = min_ask_price  # Default to expected price
+        actual_buy_amount = buy_amount  # Default to expected amount
+        
+        while time.time() - buy_fill_time < 30:  # 30 second timeout
+            try:
+                order_status = ex[min_ask_exchange].fetch_order(buy_order_id, pair)
+                if order_status['status'] == 'closed' or order_status['filled'] > 0:
+                    buy_filled = True
+                    actual_buy_amount = order_status.get('filled', buy_amount)
+                    actual_buy_price = order_status.get('average', min_ask_price)
+                    printandtelegram(f"{get_time()}Buy order filled on {min_ask_exchange}: "
+                                    f"{actual_buy_amount:.6f} {base_currency} at {actual_buy_price}")
+                    break
+                time.sleep(0.5)
+            except Exception as e:
+                printerror(m=f"Error checking buy order status: {e}")
+                time.sleep(1)
+        
+        if not buy_filled:
+            printerror(m=f"Buy order on {min_ask_exchange} did not fill in time")
+            # Try to cancel the order
+            try:
+                ex[min_ask_exchange].cancel_order(buy_order_id, pair)
+            except:
+                pass
+            return False
+        
+        # Update entry price tracking (weighted average)
+        # This tracks the average cost basis for rebalancing decisions
+        if state is not None:
+            cost_of_this_buy = actual_buy_amount * actual_buy_price
+            state.total_cost_basis += cost_of_this_buy
+            state.total_crypto_bought += actual_buy_amount
+            if state.total_crypto_bought > 0:
+                state.average_entry_price = state.total_cost_basis / state.total_crypto_bought
+        
+        # Record the profit
+        append_list_to_file('all_opportunities_profits.txt', profit_usd)
+        
+        return True
+        
+    except Exception as e:
+        printerror(m=f"Error executing real trades: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 async def monitor_arbitrage_opportunities(
     exchange_instance,
     config: TradingConfig,
     state: TradingState,
-    crypto_balances: Dict[str, float],
-    usd_balances: Dict[str, float],
     fees: Dict[str, Dict[str, float]],
     crypto_per_transaction: float,
     session_start_time: float,
@@ -391,6 +479,9 @@ async def monitor_arbitrage_opportunities(
 ) -> None:
     """Monitor for arbitrage opportunities on a single exchange."""
     
+    # Balance cache to reduce API calls
+    balance_cache = {}
+    balance_cache_timestamp = {}
     backoff_delay = 0.0  # Track backoff delay for this exchange
     
     # Only the first exchange (alphabetically) should log opportunities to prevent duplicates
@@ -444,6 +535,46 @@ async def monitor_arbitrage_opportunities(
         if not valid_ask_exchanges or not valid_bid_exchanges:
             continue
         
+        # Get real balances for validation (with caching to reduce API calls)
+        exchange_balances = {}
+        current_time = time.time()
+        
+        try:
+            for exchange_name in config.exchange_names:
+                # Check cache first
+                cache_key = exchange_name
+                if (cache_key in balance_cache and 
+                    cache_key in balance_cache_timestamp and
+                    current_time - balance_cache_timestamp[cache_key] < BALANCE_CACHE_TTL):
+                    # Use cached balance
+                    exchange_balances[exchange_name] = balance_cache[cache_key]
+                else:
+                    # Fetch fresh balance
+                    try:
+                        balance = ex[exchange_name].fetch_balance()
+                        exchange_balances[exchange_name] = {
+                            'crypto': float(balance[config.base_currency]['free']),
+                            'quote': float(balance[config.quote_currency]['free'])
+                        }
+                        # Update cache
+                        balance_cache[cache_key] = exchange_balances[exchange_name]
+                        balance_cache_timestamp[cache_key] = current_time
+                    except Exception as balance_error:
+                        if is_rate_limit_error(balance_error):
+                            # If rate limited, use cached balance if available
+                            if cache_key in balance_cache:
+                                exchange_balances[exchange_name] = balance_cache[cache_key]
+                                printerror(m=f"Rate limited fetching balance from {exchange_name}, using cached value")
+                            else:
+                                printerror(m=f"Rate limited fetching balance from {exchange_name}, no cache available")
+                                continue
+                        else:
+                            printerror(m=f"Error fetching balance from {exchange_name}: {balance_error}")
+                            continue
+        except Exception as e:
+            printerror(m=f"Error processing balances: {e}")
+            continue
+        
         # Evaluate ALL possible exchange pairs to find the one with highest profit after fees
         best_profit = float('-inf')
         best_ask_exchange = None
@@ -458,10 +589,10 @@ async def monitor_arbitrage_opportunities(
                     continue
                 
                 # Check balance availability
-                if crypto_balances.get(bid_exchange, 0) < crypto_per_transaction:
+                if exchange_balances.get(bid_exchange, {}).get('crypto', 0) < crypto_per_transaction:
                     continue
                 buy_cost = crypto_per_transaction * ask_price
-                if usd_balances.get(ask_exchange, 0) < buy_cost:
+                if exchange_balances.get(ask_exchange, {}).get('quote', 0) < buy_cost:
                     continue
                 
                 # Calculate profit after fees for this pair
@@ -493,7 +624,7 @@ async def monitor_arbitrage_opportunities(
         min_ask_price = best_ask_price
         max_bid_price = best_bid_price
         
-        # Calculate profit (we already calculated it above, but recalculate for consistency)
+        # Get fee rates
         buy_fee_rate = fees.get(min_ask_exchange, {}).get('base', 0) + fees.get(min_ask_exchange, {}).get('quote', 0)
         sell_fee_rate = fees.get(max_bid_exchange, {}).get('base', 0) + fees.get(max_bid_exchange, {}).get('quote', 0)
         
@@ -512,8 +643,8 @@ async def monitor_arbitrage_opportunities(
             
             # Calculate optimal order size FIRST (before checking profit threshold)
             # This allows us to check if a larger order would meet the profit criteria
-            available_crypto = crypto_balances.get(max_bid_exchange, 0)
-            available_quote = usd_balances.get(min_ask_exchange, 0)
+            available_crypto = exchange_balances.get(max_bid_exchange, {}).get('crypto', 0)
+            available_quote = exchange_balances.get(min_ask_exchange, {}).get('quote', 0)
             
             # Calculate optimal order size for this specific opportunity
             optimal_order_size = calculate_optimal_order_size(
@@ -553,10 +684,6 @@ async def monitor_arbitrage_opportunities(
             clear_console_lines(1)
             print("-----------------------------------------------------")
             
-            exchange_balances = format_exchange_balances(
-                crypto_balances, usd_balances, config.base_currency, config.quote_currency
-            )
-            
             elapsed_time = time.strftime('%H:%M:%S', time.gmtime(time.time() - session_start_time))
             
             print(f"{Style.RESET_ALL}Opportunity #{state.opportunity_count} detected! "
@@ -564,7 +691,6 @@ async def monitor_arbitrage_opportunities(
             print(f"Expected profit: {Fore.GREEN}+{round(profit_usd, 4)} {config.quote_currency}{Style.RESET_ALL}")
             print(f"Session total profit: {Fore.GREEN}+{round(state.total_profit_usd, 4)} {config.quote_currency}{Style.RESET_ALL}")
             print(f"Fees paid: {Fore.RED}-{round(fees_usd, 4)} {config.quote_currency} -{round(fees_crypto, 4)} {config.base_currency}")
-            print(f"{Style.DIM}{exchange_balances}")
             print(f"Time elapsed: {elapsed_time}")
             print("-----------------------------------------------------\n")
             
@@ -575,25 +701,8 @@ async def monitor_arbitrage_opportunities(
                           f"{min_ask_exchange} {min_ask_price} -> {max_bid_price} {max_bid_exchange}\n"
                           f"Time elapsed: {elapsed_time}\n"
                           f"Session total profit: {round(state.total_profit_usd, 4)} {config.quote_currency}\n"
-                          f"Fees: {round(fees_usd, 4)} {config.quote_currency} {round(fees_crypto, 4)} {config.base_currency}\n\n"
-                          f"--------BALANCES--------\n{exchange_balances}")
+                          f"Fees: {round(fees_usd, 4)} {config.quote_currency} {round(fees_crypto, 4)} {config.base_currency}")
             send_to_telegram(telegram_msg)
-            
-            # Simulate order delay if enabled
-            if demo_fake_delay:
-                timestamp = time.time()
-                delayed_ask, delayed_bid = simulate_order_delay(min_ask_exchange, max_bid_exchange, config.pair)
-                if delayed_ask and delayed_bid:
-                    min_ask_price, max_bid_price = delayed_ask, delayed_bid
-                    delay_ms = int(round(1000 * (time.time() - timestamp), 0))
-                    printandtelegram(f"{get_time()}Calculated P&L with {delay_ms}ms simulated delay")
-            
-            # Execute simulated trades with optimal order size
-            execute_simulated_trades(
-                min_ask_exchange, max_bid_exchange, min_ask_price, max_bid_price,
-                trade_order_size, profit_usd, crypto_balances, usd_balances,
-                fees, config.base_currency, state
-            )
             
             # Log if dynamic sizing was used
             if DYNAMIC_ORDER_SIZING and abs(trade_order_size - crypto_per_transaction) > crypto_per_transaction * 0.1:
@@ -602,19 +711,20 @@ async def monitor_arbitrage_opportunities(
                                f"({crypto_per_transaction:.6f} -> {trade_order_size:.6f} {config.base_currency}) "
                                f"based on {price_diff_pct:.3f}% spread")
             
-            state.total_profit_usd += profit_usd
+            # Execute real trades with optimal order size
+            trade_success = execute_real_trades(
+                min_ask_exchange, max_bid_exchange, min_ask_price, max_bid_price,
+                trade_order_size, profit_usd, config.pair, config.base_currency, fees, state
+            )
+            
+            if trade_success:
+                state.total_profit_usd += profit_usd
+                printandtelegram(f"{get_time()}Trade executed successfully! Profit: {round(profit_usd, 4)} {config.quote_currency}")
+            else:
+                printerror(m="Trade execution failed")
+            
             state.previous_ask_price = min_ask_price
             state.previous_bid_price = max_bid_price
-            
-            # Recalculate crypto per transaction based on minimum available
-            # This prevents exchanges from running out of funds
-            total_crypto = sum(crypto_balances.values())
-            min_crypto = min(crypto_balances.values()) if crypto_balances.values() else 0
-            # Use minimum to ensure all exchanges can participate, but don't go below 80% of minimum
-            crypto_per_transaction = min(
-                min_crypto * 0.8 if min_crypto > 0 else 0,
-                total_crypto / len(config.exchange_names) / 2  # Conservative fallback
-            )
         
         else:
             # Display current best opportunity (only log from one exchange to prevent duplicates)
@@ -669,33 +779,142 @@ async def monitor_arbitrage_opportunities(
         if MIN_ITERATION_DELAY > 0:
             await asyncio.sleep(MIN_ITERATION_DELAY)
 
-def simulate_initial_orders(config: TradingConfig, average_price: float, total_crypto: float) -> None:
-    """Simulate the initial order placement that would happen in real money mode."""
+def place_initial_orders(config: TradingConfig, average_price: float, total_crypto: float, state: TradingState = None) -> bool:
+    """Place initial buy orders to distribute crypto across exchanges."""
     printandtelegram(f"{get_time()}Fetching the global average price for {config.pair}...")
     printandtelegram(f"{get_time()}Average {config.pair} price in {config.quote_currency}: {average_price}")
     
-    # Simulate placing initial buy orders
+    # Calculate crypto per exchange
     crypto_per_exchange = total_crypto / len(config.exchange_names)
     
-    orders_filled = 0
-    target_orders = len(config.exchange_names)
+    orders_placed = []
     
-    # Show order placement simulation
-    for i, exchange_name in enumerate(config.exchange_names):
-        time.sleep(0.7)  # Simulate network delay
-        printandtelegram(f'{get_time()}Buy limit order of {round(crypto_per_exchange, 6)} '
-                        f'{config.base_currency} at {average_price} sent to {exchange_name}.')
+    # Place buy limit orders on each exchange
+    for exchange_name in config.exchange_names:
+        try:
+            # Get market info
+            markets = ex[exchange_name].load_markets()
+            market = markets.get(config.pair, {})
+            limits = market.get('limits', {})
+            
+            min_amount = limits.get('amount', {}).get('min', 0)
+            min_cost = limits.get('cost', {}).get('min', 0)
+            
+            # Validate order size
+            order_cost = crypto_per_exchange * average_price
+            if crypto_per_exchange < min_amount or order_cost < max(min_cost, MIN_ORDER_VALUE_USD):
+                printerror(m=f"Order size too small for {exchange_name}, skipping")
+                continue
+            
+            # Place limit buy order
+            printandtelegram(f'{get_time()}Placing buy limit order of {round(crypto_per_exchange, 6)} '
+                            f'{config.base_currency} at {average_price} on {exchange_name}.')
+            
+            # Use createOrder with limit type for better compatibility
+            order = ex[exchange_name].create_order(
+                config.pair,
+                'limit',
+                'buy',
+                crypto_per_exchange,
+                average_price
+            )
+            
+            if order:
+                orders_placed.append((exchange_name, order.get('id') or order.get('orderId')))
+                printandtelegram(f"{get_time()}Order placed on {exchange_name}, ID: {order.get('id') or order.get('orderId')}")
+            
+            time.sleep(0.5)  # Rate limiting
+            
+        except Exception as e:
+            printerror(m=f"Error placing initial order on {exchange_name}: {e}")
+            import traceback
+            traceback.print_exc()
     
-    printandtelegram(f"{get_time()}All orders sent.")
+    if not orders_placed:
+        printerror(m="No initial orders were placed")
+        return False
     
-    # Simulate order filling process
-    while orders_filled != target_orders:
-        for exchange_name in config.exchange_names:
-            if orders_filled >= target_orders:
+    printandtelegram(f"{get_time()}All orders sent. Waiting for fills...")
+    
+    # Wait for orders to fill
+    start_time = time.time()
+    timeout = first_orders_fill_timeout if first_orders_fill_timeout > 0 else DEFAULT_TIMEOUT_SECONDS
+    
+    while time.time() - start_time < timeout:
+        all_filled = True
+        for exchange_name, order_id in orders_placed:
+            try:
+                order_status = ex[exchange_name].fetch_order(order_id, config.pair)
+                if order_status['status'] != 'closed' and order_status.get('filled', 0) == 0:
+                    all_filled = False
+                    break
+                elif order_status.get('filled', 0) > 0 and order_status['status'] != 'closed':
+                    # Partially filled, still waiting
+                    all_filled = False
+                    break
+            except Exception as e:
+                printerror(m=f"Error checking order status on {exchange_name}: {e}")
+                all_filled = False
                 break
-            time.sleep(2.1)  # Simulate order fill time
-            printandtelegram(f"{get_time()}{exchange_name} order filled.")
-            orders_filled += 1
+        
+        if all_filled:
+            # Calculate average entry price from filled orders
+            total_cost = 0.0
+            total_crypto_bought = 0.0
+            for exchange_name, order_id in orders_placed:
+                try:
+                    order_status = ex[exchange_name].fetch_order(order_id, config.pair)
+                    filled = order_status.get('filled', 0)
+                    avg_price = order_status.get('average', average_price)
+                    if filled > 0:
+                        total_cost += filled * avg_price
+                        total_crypto_bought += filled
+                except:
+                    pass
+            
+            # Update state with entry price if state is provided
+            if state is not None and total_crypto_bought > 0:
+                state.average_entry_price = total_cost / total_crypto_bought
+                state.total_cost_basis = total_cost
+                state.total_crypto_bought = total_crypto_bought
+                printandtelegram(f"{get_time()}Average entry price recorded: ${state.average_entry_price:.2f}")
+            
+            printandtelegram(f"{get_time()}All initial orders filled.")
+            return True
+        
+        time.sleep(2)
+    
+    # Timeout - cancel remaining orders
+    printerror(m=f"Initial orders did not fill within {timeout} seconds. Canceling remaining orders...")
+    for exchange_name, order_id in orders_placed:
+        try:
+            order_status = ex[exchange_name].fetch_order(order_id, config.pair)
+            if order_status['status'] != 'closed':
+                ex[exchange_name].cancel_order(order_id, config.pair)
+                printandtelegram(f"{get_time()}Canceled unfilled order on {exchange_name}")
+        except Exception as e:
+            printerror(m=f"Error canceling order on {exchange_name}: {e}")
+    
+    # Still update entry price with what was filled (in case of timeout)
+    total_cost = 0.0
+    total_crypto_bought = 0.0
+    for exchange_name, order_id in orders_placed:
+        try:
+            order_status = ex[exchange_name].fetch_order(order_id, config.pair)
+            filled = order_status.get('filled', 0)
+            avg_price = order_status.get('average', average_price)
+            if filled > 0:
+                total_cost += filled * avg_price
+                total_crypto_bought += filled
+        except:
+            pass
+    
+    if state is not None and total_crypto_bought > 0:
+        state.average_entry_price = total_cost / total_crypto_bought
+        state.total_cost_basis = total_cost
+        state.total_crypto_bought = total_crypto_bought
+    
+    return False
 
 async def run_arbitrage_session(config: TradingConfig) -> None:
     """Run the main arbitrage monitoring session."""
@@ -707,13 +926,35 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     printandtelegram(f"{get_time()}Exchanges used in this session: {', '.join(sorted(config.exchange_names))}")
     printandtelegram(f"{get_time()}Total exchanges available: {len(ex)} | Active in session: {len(config.exchange_names)}")
     printandtelegram(f"{get_time()}================================\n")
-    append_new_line('logs/logs.txt', f"{get_time_blank()} INFO: Fake money session started with exchanges: {', '.join(sorted(config.exchange_names))}")
+    append_new_line('logs/logs.txt', f"{get_time_blank()} INFO: Real money session started with exchanges: {', '.join(sorted(config.exchange_names))}")
     
-    # Setup initial balances
-    usd_balances = {exchange: (config.total_investment_usd / 2) / len(config.exchange_names) 
-                   for exchange in config.exchange_names}
+    # Step 1: Detect and convert leftover cryptocurrency from different pairs
+    detect_and_convert_leftover_crypto(config.exchange_names, config.pair, config.quote_currency)
+    time.sleep(2)  # Wait for conversions to complete
     
-    # Get average price and calculate initial crypto allocation
+    # Step 2: Get real balances from exchanges
+    printandtelegram(f"{get_time()}Fetching real balances from exchanges...")
+    
+    quote_balances = {}
+    crypto_balances = {}
+    
+    for exchange_name in config.exchange_names:
+        try:
+            balance = ex[exchange_name].fetch_balance()
+            quote_balances[exchange_name] = float(balance[config.quote_currency]['free'])
+            crypto_balances[exchange_name] = float(balance[config.base_currency]['free'])
+        except Exception as e:
+            printerror(m=f"Error fetching balance from {exchange_name}: {e}")
+            quote_balances[exchange_name] = 0.0
+            crypto_balances[exchange_name] = 0.0
+    
+    total_quote = sum(quote_balances.values())
+    total_crypto = sum(crypto_balances.values())
+    
+    printandtelegram(f"{get_time()}Total balances: {total_quote:.2f} {config.quote_currency}, "
+                    f"{total_crypto:.6f} {config.base_currency}")
+    
+    # Step 3: Get average price and check balance distribution
     all_prices = []
     for exchange_instance in config.exchange_instances:
         try:
@@ -723,7 +964,6 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
             error_msg = str(e)
             error_type = type(e).__name__
             printerror(m=f"Error fetching ticker from {exchange_instance.id}: {error_type}: {error_msg}")
-            # Print full traceback for debugging SSL/connection issues
             import traceback
             traceback.print_exc()
     
@@ -732,21 +972,46 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
         return
     
     average_price = calculate_average(all_prices)
-    total_crypto = (config.total_investment_usd / 2) / average_price
-    crypto_balances = {exchange: total_crypto / len(config.exchange_names) 
-                      for exchange in config.exchange_names}
     
-    # Track initial entry price
-    if state is not None:
-        state.average_entry_price = average_price
-        state.total_cost_basis = (config.total_investment_usd / 2)
-        state.total_crypto_bought = total_crypto
-        printandtelegram(f"{get_time()}Average entry price recorded: ${state.average_entry_price:.2f}")
+    # Step 4: Check balance distribution and rebalance if needed
+    balance_info = check_balance_distribution(config.exchange_names, config.pair, config.total_investment_usd)
+    needs_rebalance = should_rebalance_balances(balance_info, config.exchange_names, config.total_investment_usd, average_price)
     
-    # Simulate the initial order placement process (like real money mode would do)
-    simulate_initial_orders(config, average_price, total_crypto)
+    if needs_rebalance:
+        printandtelegram(f"{get_time()}Balance distribution is uneven. Rebalancing to {config.quote_currency}...")
+        rebalance_to_quote_currency(config.pair, config.exchange_names)
+        time.sleep(3)  # Wait for rebalancing to complete
+        
+        # Refresh balances after rebalancing
+        for exchange_name in config.exchange_names:
+            try:
+                balance = ex[exchange_name].fetch_balance()
+                quote_balances[exchange_name] = float(balance[config.quote_currency]['free'])
+                crypto_balances[exchange_name] = float(balance[config.base_currency]['free'])
+            except Exception as e:
+                printerror(m=f"Error refreshing balance from {exchange_name}: {e}")
+        
+        total_quote = sum(quote_balances.values())
+        total_crypto = sum(crypto_balances.values())
     
-    time.sleep(1)  # Brief pause before starting main session
+    # Step 5: If we don't have enough crypto distributed, place initial orders
+    if total_crypto < config.total_investment_usd / average_price * 0.5:
+        # Need to buy crypto first
+        investment_per_exchange = config.total_investment_usd / len(config.exchange_names)
+        target_crypto_per_exchange = investment_per_exchange / average_price
+        
+        if place_initial_orders(config, average_price, target_crypto_per_exchange * len(config.exchange_names), state):
+            # Wait a bit for balances to update
+            time.sleep(3)
+            # Refresh balances
+            for exchange_name in config.exchange_names:
+                try:
+                    balance = ex[exchange_name].fetch_balance()
+                    crypto_balances[exchange_name] = float(balance[config.base_currency]['free'])
+                except Exception as e:
+                    printerror(m=f"Error refreshing balance from {exchange_name}: {e}")
+    
+    time.sleep(1)
     printandtelegram(f"{get_time()}Starting arbitrage monitoring with parameters: {sys.argv}")
     
     # Calculate fees using the actual trading pair
@@ -773,8 +1038,35 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     append_new_line('logs/logs.txt', f"{get_time_blank()} INFO: Fee structure for {config.pair}: {fees}")
     append_new_line('logs/logs.txt', f"{get_time_blank()} INFO: Fee rankings: {fee_rankings}")
     
-    # Initial crypto per transaction
-    crypto_per_transaction = total_crypto / len(config.exchange_names)
+    # Calculate crypto per transaction based on available balances
+    # Use the minimum available crypto across exchanges to ensure we can trade on all exchanges
+    # This is more conservative but ensures we don't run into balance issues
+    available_crypto_list = [crypto_balances[ex] for ex in config.exchange_names if crypto_balances[ex] > 0]
+    
+    if not available_crypto_list:
+        printerror(m="No crypto available for trading on any exchange")
+        return
+    
+    # Use the minimum available crypto, but ensure we have enough for meaningful trades
+    min_available_crypto = min(available_crypto_list)
+    total_available_crypto = sum(crypto_balances.values())
+    
+    # Calculate crypto per transaction: use minimum of:
+    # 1. Minimum available on any exchange (to ensure we can trade everywhere)
+    # 2. Average available across exchanges / 2 (conservative approach)
+    # 3. Total available / number of exchanges / 2 (original approach)
+    crypto_per_transaction = min(
+        min_available_crypto * 0.8,  # Use 80% of minimum to be safe
+        total_available_crypto / len(config.exchange_names) / 2,
+        total_available_crypto / len(config.exchange_names) / 3  # More conservative
+    )
+    
+    if crypto_per_transaction <= 0:
+        printerror(m="Calculated crypto per transaction is too small")
+        return
+    
+    printandtelegram(f"{get_time()}Crypto per transaction: {crypto_per_transaction:.6f} {config.base_currency} "
+                    f"(min available: {min_available_crypto:.6f}, total: {total_available_crypto:.6f})")
     
     # Setup session parameters
     session_start_time = time.time()
@@ -796,8 +1088,8 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
             }
         })
         task = monitor_arbitrage_opportunities(
-            pro_exchange, config, state, crypto_balances, usd_balances,
-            fees, crypto_per_transaction, session_start_time, timeout_timestamp
+            pro_exchange, config, state, fees, crypto_per_transaction,
+            session_start_time, timeout_timestamp
         )
         exchange_tasks.append(task)
     
@@ -805,76 +1097,56 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     await asyncio.gather(*exchange_tasks)
     
     # Calculate final balances
-    # Check if we should rebalance (simulate loss protection)
-    total_crypto_value = 0.0
-    current_price = 0.0
+    printandtelegram(f"{get_time()}Session finished. Calculating final balances...")
+    total_final_balance = 0.0
     
     for exchange_name in config.exchange_names:
         try:
-            ticker = ex[exchange_name].fetchTicker(config.pair)
-            current_price = float(ticker['last'])
-            total_crypto_value += crypto_balances[exchange_name] * current_price
+            balance = ex[exchange_name].fetch_balance()
+            ticker = ex[exchange_name].fetch_ticker(config.pair)
+            current_price = ticker['last']
+            
+            quote_bal = float(balance[config.quote_currency]['free'])
+            crypto_bal = float(balance[config.base_currency]['free'])
+            
+            total_final_balance += quote_bal + (crypto_bal * current_price)
         except Exception as e:
-            printerror(m=f"Error fetching price for {exchange_name}: {e}")
+            printerror(m=f"Error calculating final balance for {exchange_name}: {e}")
     
-    # Check loss threshold if entry price is tracked
-    should_rebalance = True
-    if state is not None and state.average_entry_price > 0 and current_price > 0:
-        loss_pct = (current_price - state.average_entry_price) / state.average_entry_price
-        
-        if loss_pct < REBALANCE_LOSS_THRESHOLD:
-            printandtelegram(f"{get_time()}⚠️  WARNING: Rebalancing would result in {loss_pct*100:.2f}% loss "
-                           f"(entry: ${state.average_entry_price:.2f}, current: ${current_price:.2f})")
-            printandtelegram(f"{get_time()}Skipping rebalancing to avoid locking in losses. "
-                           f"Threshold: {REBALANCE_LOSS_THRESHOLD*100:.2f}%")
-            printandtelegram(f"{get_time()}In simulation mode, crypto positions remain in balances.")
-            should_rebalance = False
-        elif loss_pct < 0:
-            printandtelegram(f"{get_time()}Current price is {loss_pct*100:.2f}% below entry, "
-                           f"but within acceptable threshold. Proceeding with rebalancing.")
-    
-    # Rebalance if enabled and within threshold
-    total_final_balance = 0.0
-    if AUTO_REBALANCE_ON_EXIT and should_rebalance:
-        for exchange_name in config.exchange_names:
-            try:
-                ticker = ex[exchange_name].fetchTicker(config.pair)
-                current_price = float(ticker['last'])
-                usd_balances[exchange_name] += crypto_balances[exchange_name] * current_price
-                crypto_balances[exchange_name] = 0
-                total_final_balance += usd_balances[exchange_name]
-            except Exception as e:
-                printerror(m=f"Error calculating final balance for {exchange_name}: {e}")
-    else:
-        # Don't rebalance - keep crypto positions
-        for exchange_name in config.exchange_names:
-            try:
-                ticker = ex[exchange_name].fetchTicker(config.pair)
-                current_price = float(ticker['last'])
-                # Calculate total value but don't convert
-                total_final_balance += usd_balances[exchange_name] + (crypto_balances[exchange_name] * current_price)
-            except Exception as e:
-                printerror(m=f"Error calculating final balance for {exchange_name}: {e}")
-    
-    # Update balance file and display results
+    # Update balance files
     try:
-        with open('real_balance.txt', 'r+') as balance_file:
-            initial_balance = float(balance_file.read())
-            balance_file.seek(0)
-            balance_file.write(str(total_final_balance))
+        with open('usable_balance.txt', 'r') as f:
+            initial_balance = float(f.read().strip())
+    except:
+        initial_balance = config.total_investment_usd
+    
+    try:
+        with open('usable_balance.txt', 'w') as f:
+            f.write(str(total_final_balance))
         
         session_profit = total_final_balance - initial_balance
         printandtelegram(f"{get_time()}Session finished.")
         printandtelegram(f"{get_time()}Total session profit: {session_profit:.4f} {config.quote_currency}")
         
-        if not should_rebalance and AUTO_REBALANCE_ON_EXIT:
-            printandtelegram(f"{get_time()}Note: Crypto positions remain in simulation balances (not converted to {config.quote_currency}).")
-        
     except Exception as e:
         printerror(m=f"Error updating final balance: {e}")
+    
+    # Rebalance at session end: convert all crypto back to quote currency
+    # This ensures clean state for next session or pair change
+    # Only rebalance if enabled and if it won't result in significant losses
+    if AUTO_REBALANCE_ON_EXIT:
+        average_entry = state.average_entry_price if state is not None and state.average_entry_price > 0 else 0.0
+        rebalanced = rebalance_to_quote_currency(config.pair, config.exchange_names, average_entry, force=False)
+        if rebalanced:
+            time.sleep(2)  # Wait for rebalancing to complete
+        else:
+            printandtelegram(f"{get_time()}Rebalancing skipped to avoid locking in losses. "
+                           f"Crypto positions remain on exchanges.")
+    else:
+        printandtelegram(f"{get_time()}Automatic rebalancing disabled. Crypto positions remain on exchanges.")
 
 def main():
-    """Main entry point for the fake money bot."""
+    """Main entry point for the real money bot."""
     # Validate arguments
     validate_arguments()
     
@@ -888,7 +1160,7 @@ def main():
     # Use command line argument if provided, otherwise use default from config
     total_investment = float(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_TARGET_INVESTMENT_USD
     timeout_minutes = int(sys.argv[3]) if len(sys.argv) > 3 else 525600  # Default: 1 year
-    session_title = str(sys.argv[4]) if len(sys.argv) > 4 else f"Fake-Money-{pair.replace('/', '')}"
+    session_title = str(sys.argv[4]) if len(sys.argv) > 4 else f"Real-Money-{pair.replace('/', '')}"
     exchange_list_str = sys.argv[5] if len(sys.argv) > 5 else ','.join(ex.keys())
     
     # Setup configuration
@@ -913,3 +1185,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

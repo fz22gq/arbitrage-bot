@@ -1,4 +1,6 @@
 ccxt>=4.0.42
+protobuf>=5.29.0,<6.0.0
 colorama>=0.4.6
 requests>=2.31.0
 pytz>=2023.3
+certifi>=2023.7.22
