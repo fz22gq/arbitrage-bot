@@ -20,7 +20,7 @@ init()
 
 # Import configuration
 from exchange_config import (
-    ex, python_command, first_orders_fill_timeout, demo_fake_delay, 
+    ex, get_exchange_instance, python_command, first_orders_fill_timeout, demo_fake_delay, 
     demo_fake_delay_ms, criteria_pct, criteria_usd, printerror, 
     get_time, get_time_blank, append_new_line, append_list_to_file,
     printandtelegram, calculate_average, send_to_telegram, get_balance,
@@ -28,7 +28,7 @@ from exchange_config import (
     REBALANCE_LOSS_THRESHOLD, ORDERBOOK_FETCH_DELAY, BALANCE_CACHE_TTL,
     MIN_ITERATION_DELAY, RATE_LIMIT_BACKOFF_BASE, MAX_RATE_LIMIT_BACKOFF,
     DEFAULT_TARGET_INVESTMENT_USD, OPPORTUNITY_LOG_THROTTLE, OPPORTUNITY_LOG_DEDUPE,
-    calculate_optimal_order_size, DYNAMIC_ORDER_SIZING
+    calculate_optimal_order_size, DYNAMIC_ORDER_SIZING, MAX_ORDER_SIZE_PCT
 )
 
 # Constants
@@ -86,30 +86,26 @@ def validate_arguments() -> None:
         sys.exit(1)
 
 def setup_exchanges(exchange_list_str: str) -> List[str]:
-    """Setup and validate exchange instances."""
-    exchange_names = exchange_list_str.split(',')
+    """Setup and validate exchange instances (lazy initialization)."""
+    exchange_names = [name.strip() for name in exchange_list_str.split(',')]
     
-    # Initialize missing exchanges with proper configuration
-    default_config = {
-        'enableRateLimit': True,
-        'options': {
-            'defaultType': 'spot',
-        }
-    }
-    
+    # Validate and initialize exchanges on-demand
     for exchange_name in exchange_names:
-        if exchange_name not in ex:
-            try:
-                ex[exchange_name] = getattr(ccxt, exchange_name)(default_config)
-            except AttributeError:
-                printerror(m=f"Unsupported exchange: {exchange_name}")
-                sys.exit(1)
-            except Exception as e:
-                error_type = type(e).__name__
-                printerror(m=f"Error creating exchange {exchange_name}: {error_type}: {e}")
-                import traceback
-                traceback.print_exc()
-                sys.exit(1)
+        try:
+            # This will initialize the exchange if needed
+            get_exchange_instance(exchange_name)
+        except ValueError as e:
+            printerror(m=f"Exchange {exchange_name} not in configured list: {e}")
+            sys.exit(1)
+        except AttributeError:
+            printerror(m=f"Unsupported exchange: {exchange_name}")
+            sys.exit(1)
+        except Exception as e:
+            error_type = type(e).__name__
+            printerror(m=f"Error creating exchange {exchange_name}: {error_type}: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
     
     return exchange_names
 
@@ -119,7 +115,8 @@ def calculate_fees(exchange_names: List[str], pair: str) -> Dict[str, Dict[str, 
     
     for exchange_name in exchange_names:
         try:
-            markets = ex[exchange_name].load_markets()
+            exchange_instance = get_exchange_instance(exchange_name)
+            markets = exchange_instance.load_markets()
             # Use the actual trading pair instead of hardcoded BTC/USDT
             pair_info = markets.get(pair, {})
             
@@ -137,7 +134,6 @@ def calculate_fees(exchange_names: List[str], pair: str) -> Dict[str, Dict[str, 
             if taker_fee == 0:
                 # Try to get default taker fee from exchange
                 try:
-                    exchange_instance = ex[exchange_name]
                     if hasattr(exchange_instance, 'fees') and 'trading' in exchange_instance.fees:
                         taker_fee = exchange_instance.fees['trading'].get('taker', 0.001)
                     else:
@@ -189,6 +185,10 @@ async def fetch_orderbook_safe(exchange_instance, pair: str, backoff_delay: floa
         if ORDERBOOK_FETCH_DELAY > 0:
             await asyncio.sleep(ORDERBOOK_FETCH_DELAY)
         
+        # NOTE: watch_order_book uses WebSocket connections that stay OPEN between calls.
+        # This maintains a persistent connection - we do NOT reconnect on each iteration.
+        # The connection is only recreated on errors (see error handling below).
+        # This is efficient and doesn't waste rate limits.
         orderbook = await exchange_instance.watch_order_book(pair)
         return orderbook, 0.0  # Return orderbook and reset backoff
     except Exception as e:
@@ -215,6 +215,8 @@ async def fetch_orderbook_safe(exchange_instance, pair: str, backoff_delay: floa
             new_backoff = max(0.0, backoff_delay / 2.0)
         
         # Try to recreate the exchange instance
+        # NOTE: This is the ONLY place where we reconnect. Reconnections only happen on errors.
+        # Normal operation maintains persistent WebSocket connections - no reconnections needed.
         try:
             exchange_id = exchange_instance.id
             await exchange_instance.close()
@@ -309,15 +311,9 @@ def simulate_order_delay(min_ask_exchange: str, max_bid_exchange: str, pair: str
     asyncio.run(asyncio.sleep(demo_fake_delay_ms / 1000))
     
     try:
-        # Use existing exchange instances from ex dict if available, otherwise create new ones
-        min_ask_ex = ex.get(min_ask_exchange) or getattr(ccxt, min_ask_exchange)({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
-        max_bid_ex = ex.get(max_bid_exchange) or getattr(ccxt, max_bid_exchange)({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
-        })
+        # Use lazy initialization to get exchange instances
+        min_ask_ex = get_exchange_instance(min_ask_exchange)
+        max_bid_ex = get_exchange_instance(max_bid_exchange)
         
         # Fetch orderbook synchronously (not using watch_order_book)
         min_ask_ob = min_ask_ex.fetch_order_book(pair)
@@ -401,7 +397,17 @@ async def monitor_arbitrage_opportunities(
     last_logged_opportunity = None
     last_log_time = 0.0
     
+    # Timing tracking for performance debugging
+    iteration_count = 0
+    last_timing_log = time.time()
+    last_heartbeat_log = time.time()  # For periodic status updates
+    
     while time.time() <= timeout_timestamp:
+        iteration_start = time.time()
+        iteration_count += 1
+        fetch_time = 0.0
+        calc_time = 0.0
+        
         if state.stop_requested:
             clear_console_lines(CONSOLE_CLEAR_LINES)
             print(f"{get_time()}Manual rebalance requested. Breaking.")
@@ -410,9 +416,22 @@ async def monitor_arbitrage_opportunities(
             break
         
         # Fetch orderbook with backoff delay
+        fetch_start = time.time()
         result = await fetch_orderbook_safe(exchange_instance, config.pair, backoff_delay)
+        fetch_time = time.time() - fetch_start
+        
         if result is None:
             # If fetch failed, wait a bit before retrying to avoid tight loop
+            if should_log and fetch_time > 0.5:
+                print(f"{get_time()}[TIMING] {exchange_instance.id}: orderbook fetch failed after {fetch_time:.3f}s")
+            # Log heartbeat even on errors
+            if should_log:
+                current_time = time.time()
+                heartbeat_interval = 10.0
+                should_heartbeat = (current_time - last_heartbeat_log) >= heartbeat_interval
+                if should_heartbeat:
+                    print(f"{get_time()}[MONITORING] {exchange_instance.id}: Recovering from orderbook fetch error...")
+                    last_heartbeat_log = current_time
             await asyncio.sleep(1.0)
             continue
         
@@ -421,6 +440,13 @@ async def monitor_arbitrage_opportunities(
         
         if not orderbook:
             # If no orderbook, wait before retrying
+            if should_log:
+                current_time = time.time()
+                heartbeat_interval = 10.0
+                should_heartbeat = (current_time - last_heartbeat_log) >= heartbeat_interval
+                if should_heartbeat:
+                    print(f"{get_time()}[MONITORING] {exchange_instance.id}: No orderbook received, retrying...")
+                    last_heartbeat_log = current_time
             await asyncio.sleep(0.5)
             continue
         
@@ -428,6 +454,13 @@ async def monitor_arbitrage_opportunities(
         if (not orderbook.get("bids") or len(orderbook["bids"]) == 0 or
             not orderbook.get("asks") or len(orderbook["asks"]) == 0):
             # Empty orderbook, wait before retrying
+            if should_log:
+                current_time = time.time()
+                heartbeat_interval = 10.0
+                should_heartbeat = (current_time - last_heartbeat_log) >= heartbeat_interval
+                if should_heartbeat:
+                    print(f"{get_time()}[MONITORING] {exchange_instance.id}: Empty orderbook, retrying...")
+                    last_heartbeat_log = current_time
             await asyncio.sleep(0.5)
             continue
         
@@ -437,19 +470,41 @@ async def monitor_arbitrage_opportunities(
         
         # Find best arbitrage opportunity by evaluating ALL exchange pairs
         # and selecting the one with highest profit after fees
+        calc_start = time.time()
+        
         # Get all exchanges with valid prices
+        # Only require at least 2 exchanges (one for buy, one for sell) to proceed
         valid_ask_exchanges = {ex: price for ex, price in state.ask_prices.items() if ex in config.exchange_names}
         valid_bid_exchanges = {ex: price for ex, price in state.bid_prices.items() if ex in config.exchange_names}
         
-        if not valid_ask_exchanges or not valid_bid_exchanges:
+        # Need at least one exchange for buying and one for selling (can be different)
+        if len(valid_ask_exchanges) < 1 or len(valid_bid_exchanges) < 1:
+            # Not enough exchanges with prices yet, continue monitoring
+            # But still log heartbeat if needed
+            if should_log:
+                current_time = time.time()
+                heartbeat_interval = 10.0
+                should_heartbeat = (current_time - last_heartbeat_log) >= heartbeat_interval
+                if should_heartbeat:
+                    print(f"{get_time()}[MONITORING] Waiting for prices from exchanges... "
+                          f"(have {len(valid_ask_exchanges)} ask, {len(valid_bid_exchanges)} bid)")
+                    last_heartbeat_log = current_time
             continue
         
         # Evaluate ALL possible exchange pairs to find the one with highest profit after fees
+        # We track both: best overall opportunity (for display) and best tradeable opportunity (for execution)
         best_profit = float('-inf')
         best_ask_exchange = None
         best_bid_exchange = None
         best_ask_price = 0.0
         best_bid_price = 0.0
+        
+        # Also track best opportunity regardless of balance constraints (for display)
+        best_display_profit = float('-inf')
+        best_display_ask_exchange = None
+        best_display_bid_exchange = None
+        best_display_ask_price = 0.0
+        best_display_bid_price = 0.0
         
         for ask_exchange, ask_price in valid_ask_exchanges.items():
             for bid_exchange, bid_price in valid_bid_exchanges.items():
@@ -457,14 +512,7 @@ async def monitor_arbitrage_opportunities(
                 if ask_exchange == bid_exchange:
                     continue
                 
-                # Check balance availability
-                if crypto_balances.get(bid_exchange, 0) < crypto_per_transaction:
-                    continue
-                buy_cost = crypto_per_transaction * ask_price
-                if usd_balances.get(ask_exchange, 0) < buy_cost:
-                    continue
-                
-                # Calculate profit after fees for this pair
+                # Calculate profit after fees for this pair (always calculate for display)
                 buy_fee_rate = fees.get(ask_exchange, {}).get('base', 0) + fees.get(ask_exchange, {}).get('quote', 0)
                 sell_fee_rate = fees.get(bid_exchange, {}).get('base', 0) + fees.get(bid_exchange, {}).get('quote', 0)
                 
@@ -476,7 +524,22 @@ async def monitor_arbitrage_opportunities(
                 # Profit = sell proceeds - buy cost
                 profit = sell_proceeds_after_fees - buy_cost_with_fees
                 
-                # Track the best opportunity
+                # Track the best opportunity for display (regardless of balance constraints)
+                if profit > best_display_profit:
+                    best_display_profit = profit
+                    best_display_ask_exchange = ask_exchange
+                    best_display_bid_exchange = bid_exchange
+                    best_display_ask_price = ask_price
+                    best_display_bid_price = bid_price
+                
+                # Check balance availability (only for tradeable opportunities)
+                if crypto_balances.get(bid_exchange, 0) < crypto_per_transaction:
+                    continue
+                buy_cost = crypto_per_transaction * ask_price
+                if usd_balances.get(ask_exchange, 0) < buy_cost:
+                    continue
+                
+                # Track the best tradeable opportunity
                 if profit > best_profit:
                     best_profit = profit
                     best_ask_exchange = ask_exchange
@@ -484,21 +547,54 @@ async def monitor_arbitrage_opportunities(
                     best_ask_price = ask_price
                     best_bid_price = bid_price
         
-        # If no profitable opportunity found, continue
-        if best_ask_exchange is None or best_bid_exchange is None:
-            continue
+        calc_time = time.time() - calc_start
         
-        min_ask_exchange = best_ask_exchange
-        max_bid_exchange = best_bid_exchange
-        min_ask_price = best_ask_price
-        max_bid_price = best_bid_price
+        # Use display opportunity if no tradeable opportunity found (for logging purposes)
+        # This ensures we always show the best spread, even if we can't trade it
+        if best_ask_exchange is None or best_bid_exchange is None:
+            # Use display opportunity for logging
+            if best_display_ask_exchange and best_display_bid_exchange:
+                min_ask_exchange = best_display_ask_exchange
+                max_bid_exchange = best_display_bid_exchange
+                min_ask_price = best_display_ask_price
+                max_bid_price = best_display_bid_price
+            else:
+                # No opportunities at all - log heartbeat and continue
+                if should_log:
+                    current_time = time.time()
+                    heartbeat_interval = 10.0
+                    should_heartbeat = (current_time - last_heartbeat_log) >= heartbeat_interval
+                    if should_heartbeat:
+                        print(f"{get_time()}[MONITORING] No opportunities found (waiting for exchange prices)")
+                        last_heartbeat_log = current_time
+                continue
+        else:
+            # We have a tradeable opportunity - use it
+            min_ask_exchange = best_ask_exchange
+            max_bid_exchange = best_bid_exchange
+            min_ask_price = best_ask_price
+            max_bid_price = best_bid_price
+        
+        # Validate prices before proceeding (guard against division by zero)
+        # This prevents "float division by zero" errors when prices are invalid
+        if (not min_ask_exchange or not max_bid_exchange or 
+            min_ask_price is None or max_bid_price is None or
+            min_ask_price <= 0 or max_bid_price <= 0):
+            # Invalid prices or exchanges - skip this iteration
+            continue
         
         # Calculate profit (we already calculated it above, but recalculate for consistency)
         buy_fee_rate = fees.get(min_ask_exchange, {}).get('base', 0) + fees.get(min_ask_exchange, {}).get('quote', 0)
         sell_fee_rate = fees.get(max_bid_exchange, {}).get('base', 0) + fees.get(max_bid_exchange, {}).get('quote', 0)
         
         # Check spread percentage first (doesn't depend on order size)
-        price_diff_pct = abs(min_ask_price - max_bid_price) / ((max_bid_price + min_ask_price) / 2) * 100
+        # Guard against division by zero if prices are invalid
+        avg_price = (max_bid_price + min_ask_price) / 2
+        if avg_price > 0:
+            price_diff_pct = abs(min_ask_price - max_bid_price) / avg_price * 100
+        else:
+            price_diff_pct = 0.0  # Invalid prices, skip this opportunity
+            continue
         
         # Initialize trade_order_size
         trade_order_size = None
@@ -611,34 +707,79 @@ async def monitor_arbitrage_opportunities(
             total_crypto = sum(crypto_balances.values())
             min_crypto = min(crypto_balances.values()) if crypto_balances.values() else 0
             # Use minimum to ensure all exchanges can participate, but don't go below 80% of minimum
+            old_crypto_per_transaction = crypto_per_transaction
             crypto_per_transaction = min(
                 min_crypto * 0.8 if min_crypto > 0 else 0,
                 total_crypto / len(config.exchange_names) / 2  # Conservative fallback
             )
+            # Log if order size was significantly reduced
+            if should_log and old_crypto_per_transaction > 0:
+                reduction_pct = ((crypto_per_transaction - old_crypto_per_transaction) / old_crypto_per_transaction) * 100
+                if reduction_pct < -10:  # More than 10% reduction
+                    print(f"{get_time()}[BALANCE] Order size reduced by {abs(reduction_pct):.1f}% "
+                          f"({old_crypto_per_transaction:.6f} -> {crypto_per_transaction:.6f} {config.base_currency}) "
+                          f"due to balance constraints (min: {min_crypto:.6f}, total: {total_crypto:.6f})")
         
         else:
             # Display current best opportunity (only log from one exchange to prevent duplicates)
+            # Always show the best spread, even if it's not profitable
             if should_log:
                 current_time = time.time()
                 current_opportunity = (min_ask_exchange, max_bid_exchange, round(min_ask_price, 2), round(max_bid_price, 2))
                 
                 # Check if we should log this opportunity
+                # Reduced throttling to show opportunities more frequently
                 should_log_this = True
                 if OPPORTUNITY_LOG_DEDUPE:
                     # Only log if opportunity changed
                     if current_opportunity == last_logged_opportunity:
                         should_log_this = False
                 
-                # Throttle logging frequency
-                if should_log_this and (current_time - last_log_time) < OPPORTUNITY_LOG_THROTTLE:
+                # Reduced throttle: show opportunities more frequently (1 second instead of 2)
+                reduced_throttle = max(1.0, OPPORTUNITY_LOG_THROTTLE / 2.0)
+                if should_log_this and (current_time - last_log_time) < reduced_throttle:
                     should_log_this = False
                 
+                # Periodic heartbeat: log status every 10 seconds even if opportunity hasn't changed
+                # This shows the bot is still running and monitoring
+                heartbeat_interval = 10.0  # Log heartbeat every 10 seconds
+                should_heartbeat = (current_time - last_heartbeat_log) >= heartbeat_interval
+                
                 if should_log_this:
-                    # Calculate profit with base order size for display (so users can see opportunity)
+                    # Calculate profit with dynamic order sizing for display (if enabled)
+                    # This shows what the profit would be with optimal sizing, not just base size
+                    fee_calc_start = time.time()
                     buy_fee_rate = fees.get(min_ask_exchange, {}).get('base', 0) + fees.get(min_ask_exchange, {}).get('quote', 0)
                     sell_fee_rate = fees.get(max_bid_exchange, {}).get('base', 0) + fees.get(max_bid_exchange, {}).get('quote', 0)
-                    buy_cost_with_fees = crypto_per_transaction * min_ask_price * (1 + buy_fee_rate)
-                    sell_proceeds_after_fees = crypto_per_transaction * max_bid_price * (1 - sell_fee_rate)
+                    
+                    # Use dynamic order sizing if enabled, otherwise use base size
+                    if DYNAMIC_ORDER_SIZING:
+                        available_crypto = crypto_balances.get(max_bid_exchange, 0)
+                        available_quote = usd_balances.get(min_ask_exchange, 0)
+                        display_order_size = calculate_optimal_order_size(
+                            min_ask_price=min_ask_price,
+                            max_bid_price=max_bid_price,
+                            available_crypto=available_crypto,
+                            available_quote=available_quote,
+                            buy_fee_rate=buy_fee_rate,
+                            sell_fee_rate=sell_fee_rate,
+                            min_order_value=MIN_ORDER_VALUE_USD,
+                            base_order_size=crypto_per_transaction
+                        )
+                        # Log balance constraints if size was significantly reduced (for debugging)
+                        # This helps understand why order sizes are reduced (e.g., -75% due to MAX_ORDER_SIZE_PCT = 25%)
+                        if should_log and abs(display_order_size - crypto_per_transaction) > crypto_per_transaction * 0.2:
+                            max_from_crypto = available_crypto * MAX_ORDER_SIZE_PCT
+                            max_from_quote = (available_quote / min_ask_price) * MAX_ORDER_SIZE_PCT if min_ask_price > 0 else 0
+                            limiting_factor = "crypto balance" if max_from_crypto < max_from_quote else "quote balance"
+                            print(f"{get_time()}[SIZING] Base: {crypto_per_transaction:.6f} -> Optimal: {display_order_size:.6f} "
+                                  f"(limited by {limiting_factor}: {min(max_from_crypto, max_from_quote):.6f} = 25% of available)")
+                    else:
+                        display_order_size = crypto_per_transaction
+                    
+                    # Calculate profit with display order size
+                    buy_cost_with_fees = display_order_size * min_ask_price * (1 + buy_fee_rate)
+                    sell_proceeds_after_fees = display_order_size * max_bid_price * (1 - sell_fee_rate)
                     display_profit_usd = sell_proceeds_after_fees - buy_cost_with_fees
                     
                     # Don't clear console - let it scroll naturally to show history
@@ -651,23 +792,132 @@ async def monitor_arbitrage_opportunities(
                     price_spread = max_bid_price - min_ask_price
                     spread_pct = (price_spread / min_ask_price) * 100 if min_ask_price > 0 else 0
                     
-                    # Calculate total fee in USD for display
-                    buy_fee_usd = crypto_per_transaction * min_ask_price * buy_fee_rate
-                    sell_fee_usd = crypto_per_transaction * max_bid_price * sell_fee_rate
+                    # Calculate total fee in USD for display (using display order size)
+                    buy_fee_usd = display_order_size * min_ask_price * buy_fee_rate
+                    sell_fee_usd = display_order_size * max_bid_price * sell_fee_rate
                     total_fee_usd = buy_fee_usd + sell_fee_usd
+                    fee_calc_time = time.time() - fee_calc_start
+                    
+                    # Calculate order size in USD for context
+                    order_size_usd = display_order_size * min_ask_price
+                    
+                    # Show if dynamic sizing adjusted the order size
+                    size_indicator = ""
+                    if DYNAMIC_ORDER_SIZING and abs(display_order_size - crypto_per_transaction) > crypto_per_transaction * 0.05:
+                        size_change_pct = ((display_order_size - crypto_per_transaction) / crypto_per_transaction) * 100
+                        size_indicator = f" [size: {size_change_pct:+.1f}%]"
                     
                     print(f"{get_time()}Best: {color}{round(display_profit_usd, 4)} {config.quote_currency}{Style.RESET_ALL} "
-                          f"(fees: {round(total_fee_usd, 4)}) buy: {min_ask_exchange} at {min_ask_price:.{price_precision}f} "
+                          f"(fees: {round(total_fee_usd, 4)}, order: {display_order_size:.6f} {config.base_currency} = ${order_size_usd:.2f}{size_indicator}) "
+                          f"buy: {min_ask_exchange} at {min_ask_price:.{price_precision}f} "
                           f"sell: {max_bid_exchange} at {max_bid_price:.{price_precision}f} "
                           f"(spread: {spread_pct:+.4f}%)")
                     
                     # Update tracking
                     last_logged_opportunity = current_opportunity
                     last_log_time = current_time
+                    last_heartbeat_log = current_time  # Reset heartbeat timer when we log
+                    
+                    # Log timing if fee calculation took significant time
+                    if fee_calc_time > 0.001:  # More than 1ms
+                        print(f"{get_time()}[TIMING] Fee calc took {fee_calc_time*1000:.2f}ms")
+                
+                elif should_heartbeat:
+                    # Periodic heartbeat: show bot is still monitoring even if opportunity hasn't changed
+                    # Calculate profit with dynamic order sizing for display (if enabled)
+                    buy_fee_rate = fees.get(min_ask_exchange, {}).get('base', 0) + fees.get(min_ask_exchange, {}).get('quote', 0)
+                    sell_fee_rate = fees.get(max_bid_exchange, {}).get('base', 0) + fees.get(max_bid_exchange, {}).get('quote', 0)
+                    
+                    # Use dynamic order sizing if enabled, otherwise use base size
+                    if DYNAMIC_ORDER_SIZING:
+                        available_crypto = crypto_balances.get(max_bid_exchange, 0)
+                        available_quote = usd_balances.get(min_ask_exchange, 0)
+                        display_order_size = calculate_optimal_order_size(
+                            min_ask_price=min_ask_price,
+                            max_bid_price=max_bid_price,
+                            available_crypto=available_crypto,
+                            available_quote=available_quote,
+                            buy_fee_rate=buy_fee_rate,
+                            sell_fee_rate=sell_fee_rate,
+                            min_order_value=MIN_ORDER_VALUE_USD,
+                            base_order_size=crypto_per_transaction
+                        )
+                    else:
+                        display_order_size = crypto_per_transaction
+                    
+                    # Calculate profit with display order size
+                    buy_cost_with_fees = display_order_size * min_ask_price * (1 + buy_fee_rate)
+                    sell_proceeds_after_fees = display_order_size * max_bid_price * (1 - sell_fee_rate)
+                    display_profit_usd = sell_proceeds_after_fees - buy_cost_with_fees
+                    
+                    color = Fore.GREEN if display_profit_usd > 0 else Fore.RED if display_profit_usd < 0 else Fore.WHITE
+                    price_precision = 8 if min_ask_price < 1.0 else 6 if min_ask_price < 100.0 else 4
+                    price_spread = max_bid_price - min_ask_price
+                    # Guard against division by zero
+                    if min_ask_price > 0:
+                        spread_pct = (price_spread / min_ask_price) * 100
+                    else:
+                        spread_pct = 0.0
+                    buy_fee_usd = display_order_size * min_ask_price * buy_fee_rate
+                    sell_fee_usd = display_order_size * max_bid_price * sell_fee_rate
+                    total_fee_usd = buy_fee_usd + sell_fee_usd
+                    
+                    # Calculate order size in USD for context
+                    order_size_usd = display_order_size * min_ask_price
+                    
+                    # Show if dynamic sizing adjusted the order size
+                    size_indicator = ""
+                    if DYNAMIC_ORDER_SIZING and abs(display_order_size - crypto_per_transaction) > crypto_per_transaction * 0.05:
+                        size_change_pct = ((display_order_size - crypto_per_transaction) / crypto_per_transaction) * 100
+                        size_indicator = f" [size: {size_change_pct:+.1f}%]"
+                    
+                    print(f"{get_time()}[MONITORING] Best: {color}{round(display_profit_usd, 4)} {config.quote_currency}{Style.RESET_ALL} "
+                          f"(fees: {round(total_fee_usd, 4)}, order: {display_order_size:.6f} {config.base_currency} = ${order_size_usd:.2f}{size_indicator}) "
+                          f"buy: {min_ask_exchange} at {min_ask_price:.{price_precision}f} "
+                          f"sell: {max_bid_exchange} at {max_bid_price:.{price_precision}f} "
+                          f"(spread: {spread_pct:+.4f}%) - No change")
+                    last_heartbeat_log = current_time
         
-        # Add minimum delay between iterations to prevent overwhelming APIs
-        if MIN_ITERATION_DELAY > 0:
-            await asyncio.sleep(MIN_ITERATION_DELAY)
+        # Calculate total iteration time
+        iteration_time = time.time() - iteration_start
+        
+        # Always check heartbeat at end of iteration (fallback if we missed it earlier)
+        # This ensures we log something every 10 seconds even if we hit early continues
+        if should_log:
+            current_time = time.time()
+            heartbeat_interval = 10.0
+            should_heartbeat = (current_time - last_heartbeat_log) >= heartbeat_interval
+            if should_heartbeat:
+                # Count how many exchanges have prices
+                valid_asks = len([ex for ex, price in state.ask_prices.items() if ex in config.exchange_names])
+                valid_bids = len([ex for ex, price in state.bid_prices.items() if ex in config.exchange_names])
+                if valid_asks >= 1 and valid_bids >= 1:
+                    # We have prices but didn't log - opportunity probably hasn't changed
+                    print(f"{get_time()}[MONITORING] Bot running - monitoring {valid_asks} ask / {valid_bids} bid exchanges")
+                else:
+                    print(f"{get_time()}[MONITORING] Bot running - waiting for exchange prices... ({valid_asks} ask, {valid_bids} bid)")
+                last_heartbeat_log = current_time
+        
+        # Log timing every 10 iterations or if iteration took > 1 second
+        if should_log and (iteration_count % 10 == 0 or iteration_time > 1.0 or 
+                          (time.time() - last_timing_log) > 5.0):
+            print(f"{get_time()}[TIMING] {exchange_instance.id} iter #{iteration_count}: "
+                  f"fetch={fetch_time*1000:.1f}ms, calc={calc_time*1000:.1f}ms, total={iteration_time*1000:.1f}ms")
+            last_timing_log = time.time()
+        
+        # Add minimum delay between iterations (target ~2 seconds per update)
+        # This ensures continuous monitoring without overwhelming APIs
+        # Adjust delay to target ~2 seconds total per iteration
+        # NOTE: This sleep is just a rate-limiting delay between iterations.
+        # The WebSocket connection (watch_order_book) stays OPEN between iterations - we do NOT reconnect.
+        # Reconnections only happen on errors (see fetch_orderbook_safe error handling).
+        # This prevents wasting rate limits by maintaining persistent connections.
+        target_iteration_time = 2.0  # Target 2 seconds per iteration
+        elapsed_time = time.time() - iteration_start
+        remaining_delay = max(0.0, target_iteration_time - elapsed_time)
+        iteration_delay = max(MIN_ITERATION_DELAY, remaining_delay)
+        
+        await asyncio.sleep(iteration_delay)
 
 def simulate_initial_orders(config: TradingConfig, average_price: float, total_crypto: float) -> None:
     """Simulate the initial order placement that would happen in real money mode."""
@@ -703,9 +953,9 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     
     # Log exchange configuration at session start
     printandtelegram(f"{get_time()}=== Exchange Configuration ===")
-    printandtelegram(f"{get_time()}Configured exchanges in exchange_config.py: {', '.join(sorted(ex.keys()))}")
     printandtelegram(f"{get_time()}Exchanges used in this session: {', '.join(sorted(config.exchange_names))}")
-    printandtelegram(f"{get_time()}Total exchanges available: {len(ex)} | Active in session: {len(config.exchange_names)}")
+    printandtelegram(f"{get_time()}Active exchanges in session: {len(config.exchange_names)}")
+    printandtelegram(f"{get_time()}Note: Only active exchanges are initialized (lazy loading)")
     printandtelegram(f"{get_time()}================================\n")
     append_new_line('logs/logs.txt', f"{get_time_blank()} INFO: Fake money session started with exchanges: {', '.join(sorted(config.exchange_names))}")
     
@@ -715,14 +965,15 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     
     # Get average price and calculate initial crypto allocation
     all_prices = []
-    for exchange_instance in config.exchange_instances:
+    for exchange_name in config.exchange_names:
         try:
+            exchange_instance = get_exchange_instance(exchange_name)
             ticker = exchange_instance.fetch_ticker(config.pair)
             all_prices.append(ticker['last'])
         except Exception as e:
             error_msg = str(e)
             error_type = type(e).__name__
-            printerror(m=f"Error fetching ticker from {exchange_instance.id}: {error_type}: {error_msg}")
+            printerror(m=f"Error fetching ticker from {exchange_name}: {error_type}: {error_msg}")
             # Print full traceback for debugging SSL/connection issues
             import traceback
             traceback.print_exc()
@@ -774,7 +1025,20 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     append_new_line('logs/logs.txt', f"{get_time_blank()} INFO: Fee rankings: {fee_rankings}")
     
     # Initial crypto per transaction
+    # NOTE: This scales inversely with price to keep USD order size similar across different tokens.
+    # For example: BTC at $87k -> ~0.004 BTC per order (~$350), XRP at $1.87 -> ~191 XRP per order (~$350)
+    # This is why profit values in USD are similar - the order sizes are similar in USD value.
     crypto_per_transaction = total_crypto / len(config.exchange_names)
+    order_size_usd_initial = crypto_per_transaction * average_price
+    printandtelegram(f"{get_time()}Initial order size: {crypto_per_transaction:.6f} {config.base_currency} "
+                    f"(~${order_size_usd_initial:.2f} per transaction)")
+    printandtelegram(f"{get_time()}Initial balances: {total_crypto:.6f} {config.base_currency} total "
+                    f"({crypto_per_transaction:.6f} per exchange), "
+                    f"${config.total_investment_usd/2:.2f} {config.quote_currency} total "
+                    f"(${config.total_investment_usd/2/len(config.exchange_names):.2f} per exchange)")
+    if DYNAMIC_ORDER_SIZING:
+        printandtelegram(f"{get_time()}Dynamic sizing: MAX_ORDER_SIZE_PCT={MAX_ORDER_SIZE_PCT*100:.0f}% "
+                        f"(orders limited to {MAX_ORDER_SIZE_PCT*100:.0f}% of available balance per trade)")
     
     # Setup session parameters
     session_start_time = time.time()
@@ -787,22 +1051,47 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     
     # Create exchange monitoring tasks
     exchange_tasks = []
-    for exchange_instance in config.exchange_instances:
-        # Create ccxt.pro instance with proper configuration
-        pro_exchange = getattr(ccxt.pro, exchange_instance.id)({
-            'enableRateLimit': True,
-            'options': {
-                'defaultType': 'spot',
-            }
-        })
-        task = monitor_arbitrage_opportunities(
-            pro_exchange, config, state, crypto_balances, usd_balances,
-            fees, crypto_per_transaction, session_start_time, timeout_timestamp
-        )
-        exchange_tasks.append(task)
+    for exchange_name in config.exchange_names:
+        try:
+            # Get the regular exchange instance first to validate it works
+            exchange_instance = get_exchange_instance(exchange_name)
+            
+            # Create ccxt.pro instance with proper configuration for WebSocket monitoring
+            pro_exchange = getattr(ccxt.pro, exchange_instance.id)({
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'spot',
+                }
+            })
+            task = monitor_arbitrage_opportunities(
+                pro_exchange, config, state, crypto_balances, usd_balances,
+                fees, crypto_per_transaction, session_start_time, timeout_timestamp
+            )
+            exchange_tasks.append(task)
+            printandtelegram(f"{get_time()}Started monitoring task for {exchange_name}")
+        except Exception as e:
+            printerror(m=f"Failed to start monitoring for {exchange_name}: {e}")
+            append_new_line('logs/logs.txt', 
+                f"{get_time_blank()} ERROR: Failed to start monitoring for {exchange_name}: {e}")
+            # Continue with other exchanges even if one fails
     
-    # Run all monitoring tasks
-    await asyncio.gather(*exchange_tasks)
+    if not exchange_tasks:
+        printerror(m="No exchange monitoring tasks could be started. Exiting.")
+        return
+    
+    printandtelegram(f"{get_time()}Started {len(exchange_tasks)} exchange monitoring task(s)")
+    
+    # Run all monitoring tasks with error handling
+    # Use return_exceptions=True so one failing exchange doesn't stop others
+    results = await asyncio.gather(*exchange_tasks, return_exceptions=True)
+    
+    # Log any exceptions that occurred
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            exchange_name = config.exchange_names[i] if i < len(config.exchange_names) else "unknown"
+            printerror(m=f"Monitoring task for {exchange_name} failed: {result}")
+            append_new_line('logs/logs.txt', 
+                f"{get_time_blank()} ERROR: Monitoring task for {exchange_name} failed: {result}")
     
     # Calculate final balances
     # Check if we should rebalance (simulate loss protection)
@@ -811,7 +1100,8 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     
     for exchange_name in config.exchange_names:
         try:
-            ticker = ex[exchange_name].fetchTicker(config.pair)
+            exchange_instance = get_exchange_instance(exchange_name)
+            ticker = exchange_instance.fetchTicker(config.pair)
             current_price = float(ticker['last'])
             total_crypto_value += crypto_balances[exchange_name] * current_price
         except Exception as e:
@@ -838,7 +1128,8 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
     if AUTO_REBALANCE_ON_EXIT and should_rebalance:
         for exchange_name in config.exchange_names:
             try:
-                ticker = ex[exchange_name].fetchTicker(config.pair)
+                exchange_instance = get_exchange_instance(exchange_name)
+                ticker = exchange_instance.fetchTicker(config.pair)
                 current_price = float(ticker['last'])
                 usd_balances[exchange_name] += crypto_balances[exchange_name] * current_price
                 crypto_balances[exchange_name] = 0
@@ -849,7 +1140,8 @@ async def run_arbitrage_session(config: TradingConfig) -> None:
         # Don't rebalance - keep crypto positions
         for exchange_name in config.exchange_names:
             try:
-                ticker = ex[exchange_name].fetchTicker(config.pair)
+                exchange_instance = get_exchange_instance(exchange_name)
+                ticker = exchange_instance.fetchTicker(config.pair)
                 current_price = float(ticker['last'])
                 # Calculate total value but don't convert
                 total_final_balance += usd_balances[exchange_name] + (crypto_balances[exchange_name] * current_price)
@@ -893,7 +1185,8 @@ def main():
     
     # Setup configuration
     exchange_names = setup_exchanges(exchange_list_str)
-    exchange_instances = [ex[name] for name in exchange_names]
+    # Initialize exchange instances lazily - only the ones we need
+    exchange_instances = [get_exchange_instance(name) for name in exchange_names]
     
     config = TradingConfig(
         pair=pair,

@@ -348,7 +348,8 @@ def get_balance(exchange_name: str, pair: str) -> float:
         # Extract base currency from pair
         base_currency = pair.split('/')[0] if '/' in pair else pair.replace('/USDT', '')
         
-        balance_info = ex[exchange_name].fetch_balance()
+        exchange_instance = get_exchange_instance(exchange_name)
+        balance_info = exchange_instance.fetch_balance()
         return float(balance_info[base_currency]['free'])
     except (KeyError, ValueError, TypeError):
         return 0.0
@@ -359,7 +360,8 @@ def get_balance(exchange_name: str, pair: str) -> float:
 def get_precision_min(pair: str, exchange_name: str) -> Optional[float]:
     """Get the minimum price precision for a trading pair on an exchange."""
     try:
-        pair_info = ex[exchange_name].load_markets(pair)
+        exchange_instance = get_exchange_instance(exchange_name)
+        pair_info = exchange_instance.load_markets(pair)
         return pair_info[pair]['limits']['price']['min']
     except Exception as e:
         printerror(m=f"Error getting price precision for {pair} on {exchange_name}: {e}")
@@ -384,7 +386,8 @@ def get_balance_usdt(exchange_list: List[str]) -> float:
     
     for exchange_name in exchange_list:
         try:
-            balances = ex[exchange_name].fetchBalance()
+            exchange_instance = get_exchange_instance(exchange_name)
+            balances = exchange_instance.fetchBalance()
             total_balance += float(balances['USDT']['free'])
         except Exception as e:
             printerror(m=f"Error fetching USDT balance from {exchange_name}: {e}")
@@ -394,14 +397,15 @@ def get_balance_usdt(exchange_list: List[str]) -> float:
 def cancel_all_orders(exchange_name: str, pair: str) -> bool:
     """Cancel all open orders for a pair on an exchange."""
     try:
-        if not ex[exchange_name].has['cancelAllOrders']:
+        exchange_instance = get_exchange_instance(exchange_name)
+        if not exchange_instance.has['cancelAllOrders']:
             return False
         
-        open_orders = ex[exchange_name].fetchOpenOrders(pair)
+        open_orders = exchange_instance.fetchOpenOrders(pair)
         if not open_orders:
             return True
         
-        ex[exchange_name].cancelAllOrders(pair)
+        exchange_instance.cancelAllOrders(pair)
         print(f"{get_time()}Successfully canceled all orders on {exchange_name}.")
         append_new_line(LOGS_FILE, f"{get_time_blank()} INFO: Successfully canceled all orders on {exchange_name}.")
         return True
@@ -423,8 +427,9 @@ def emergency_convert_list(pair_to_sell: str, exchange_list: List[str]) -> None:
                 continue
             
             # Get market info and current price
-            markets = ex[exchange_name].load_markets()
-            ticker = ex[exchange_name].fetch_ticker(pair_to_sell)
+            exchange_instance = get_exchange_instance(exchange_name)
+            markets = exchange_instance.load_markets()
+            ticker = exchange_instance.fetch_ticker(pair_to_sell)
             current_price = float(ticker['last'])
             
             # Get trading limits
@@ -442,7 +447,7 @@ def emergency_convert_list(pair_to_sell: str, exchange_list: List[str]) -> None:
                 order_value >= MIN_ORDER_VALUE_USD):
                 
                 # Execute market sell order
-                ex[exchange_name].createMarketSellOrder(pair_to_sell, balance)
+                exchange_instance.createMarketSellOrder(pair_to_sell, balance)
                 
                 base_currency = pair_to_sell.split('/')[0]
                 print(f"{get_time()}Successfully sold {balance:.6f} {base_currency} on {exchange_name}.")
@@ -480,7 +485,8 @@ def convert_crypto_to_quote(exchange_name: str, base_currency: str, quote_curren
             return True  # No balance to convert, consider it successful
         
         # Get market info and current price
-        ticker = ex[exchange_name].fetch_ticker(pair)
+        exchange_instance = get_exchange_instance(exchange_name)
+        ticker = exchange_instance.fetch_ticker(pair)
         current_price = float(ticker['last'])
         
         # Get trading limits
@@ -498,7 +504,7 @@ def convert_crypto_to_quote(exchange_name: str, base_currency: str, quote_curren
             order_value >= MIN_ORDER_VALUE_USD):
             
             # Execute market sell order
-            ex[exchange_name].createMarketSellOrder(pair, balance)
+            exchange_instance.createMarketSellOrder(pair, balance)
             print(f"{get_time()}Converted {balance:.6f} {base_currency} to {quote_currency} on {exchange_name}.")
             append_new_line(LOGS_FILE, 
                 f"{get_time_blank()} INFO: Converted {balance:.6f} {base_currency} to {quote_currency} on {exchange_name}."
@@ -525,7 +531,8 @@ def detect_and_convert_leftover_crypto(exchange_list: List[str], current_pair: s
     
     for exchange_name in exchange_list:
         try:
-            balance = ex[exchange_name].fetch_balance()
+            exchange_instance = get_exchange_instance(exchange_name)
+            balance = exchange_instance.fetch_balance()
             
             # Check each common crypto
             for crypto in common_cryptos:
@@ -542,7 +549,7 @@ def detect_and_convert_leftover_crypto(exchange_list: List[str], current_pair: s
                         if convert_crypto_to_quote(exchange_name, crypto, quote_currency):
                             # Calculate value converted
                             try:
-                                ticker = ex[exchange_name].fetch_ticker(f"{crypto}/{quote_currency}")
+                                ticker = exchange_instance.fetch_ticker(f"{crypto}/{quote_currency}")
                                 value = crypto_balance * float(ticker['last'])
                                 total_converted_value += value
                                 converted_count += 1
@@ -581,7 +588,8 @@ def rebalance_to_quote_currency(pair: str, exchange_list: List[str], average_ent
             prices = []
             for exchange_name in exchange_list:
                 try:
-                    ticker = ex[exchange_name].fetch_ticker(pair)
+                    exchange_instance = get_exchange_instance(exchange_name)
+                    ticker = exchange_instance.fetch_ticker(pair)
                     prices.append(float(ticker['last']))
                 except:
                     pass
@@ -646,7 +654,8 @@ def check_balance_distribution(exchange_list: List[str], pair: str, target_inves
     
     for exchange_name in exchange_list:
         try:
-            balance = ex[exchange_name].fetch_balance()
+            exchange_instance = get_exchange_instance(exchange_name)
+            balance = exchange_instance.fetch_balance()
             quote_bal = float(balance[quote_currency]['free'])
             crypto_bal = float(balance[base_currency]['free'])
             
@@ -715,18 +724,13 @@ def calculate_fees(exchange_names: List[str], pair: str) -> Dict[str, Dict[str, 
     
     for exchange_name in exchange_names:
         try:
-            if exchange_name not in ex:
-                try:
-                    default_config = {
-                        'enableRateLimit': True,
-                        'options': {'defaultType': 'spot'}
-                    }
-                    ex[exchange_name] = getattr(ccxt, exchange_name)(default_config)
-                except:
-                    fees[exchange_name] = {'base': 0, 'quote': 0.001}  # Default 0.1%
-                    continue
+            try:
+                exchange_instance = get_exchange_instance(exchange_name)
+            except:
+                fees[exchange_name] = {'base': 0, 'quote': 0.001}  # Default 0.1%
+                continue
             
-            markets = ex[exchange_name].load_markets()
+            markets = exchange_instance.load_markets()
             pair_info = markets.get(pair, {})
             
             # If the pair doesn't exist, fall back to BTC/USDT as reference
@@ -740,7 +744,6 @@ def calculate_fees(exchange_names: List[str], pair: str) -> Dict[str, Dict[str, 
             # If taker fee is not available, try to get it from exchange defaults
             if taker_fee == 0:
                 try:
-                    exchange_instance = ex[exchange_name]
                     if hasattr(exchange_instance, 'fees') and 'trading' in exchange_instance.fees:
                         taker_fee = exchange_instance.fees['trading'].get('taker', 0.001)
                     else:
@@ -786,26 +789,21 @@ def check_all_exchange_fees(pair: str = 'BTC/USDT', favorable_threshold: float =
     # Only check exchanges that are actually configured in the exchanges dict
     for exchange_name in sorted(exchanges.keys()):
         try:
-            # Try to initialize exchange if not already initialized
-            if exchange_name not in ex:
-                try:
-                    default_config = {
-                        'enableRateLimit': True,
-                        'options': {'defaultType': 'spot'}
-                    }
-                    ex[exchange_name] = getattr(ccxt, exchange_name)(default_config)
-                except (AttributeError, Exception) as e:
-                    # Exchange not supported or initialization failed
-                    exchange_fees[exchange_name] = {
-                        'total_fee': None,
-                        'status': 'not_supported',
-                        'error': str(e)
-                    }
-                    continue
+            # Try to get exchange instance (lazy initialization)
+            try:
+                exchange_instance = get_exchange_instance(exchange_name)
+            except (AttributeError, Exception) as e:
+                # Exchange not supported or initialization failed
+                exchange_fees[exchange_name] = {
+                    'total_fee': None,
+                    'status': 'not_supported',
+                    'error': str(e)
+                }
+                continue
             
             # Try to get fees
             try:
-                markets = ex[exchange_name].load_markets()
+                markets = exchange_instance.load_markets()
                 pair_info = markets.get(pair, {})
                 
                 # Fallback to BTC/USDT if pair not found
@@ -819,7 +817,6 @@ def check_all_exchange_fees(pair: str = 'BTC/USDT', favorable_threshold: float =
                 # If taker fee not available, try exchange defaults
                 if taker_fee == 0:
                     try:
-                        exchange_instance = ex[exchange_name]
                         if hasattr(exchange_instance, 'fees') and 'trading' in exchange_instance.fees:
                             taker_fee = exchange_instance.fees['trading'].get('taker', 0.001)
                         else:
@@ -868,43 +865,83 @@ def check_all_exchange_fees(pair: str = 'BTC/USDT', favorable_threshold: float =
         'favorable_threshold': favorable_threshold
     }
 
-# Initialize exchange instances
-try:
-    # Add default configuration for all exchanges (enableRateLimit, SSL settings for test mode)
-    # For test/fake-money mode, we can disable SSL verification if needed
-    # Set this to True if you encounter SSL certificate issues in test environments
-    DISABLE_SSL_VERIFY = False  # Set to True only for testing if SSL issues occur
-    
-    default_config = {
-        'enableRateLimit': True,
-        'options': {
-            'defaultType': 'spot',  # Use spot trading by default
-        }
+# Initialize exchange instances LAZILY (only when needed)
+# This prevents initializing all 59 exchanges at startup, which can cause stalling
+DISABLE_SSL_VERIFY = False  # Set to True only for testing if SSL issues occur
+
+default_config = {
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'spot',  # Use spot trading by default
     }
+}
+
+# Add SSL verification setting if disabled
+if DISABLE_SSL_VERIFY:
+    default_config['verify'] = False
+    # Also configure requests to not verify SSL
+    import ssl
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Exchange cache - only initialized exchanges are stored here
+# We use a custom dict-like class to support lazy initialization
+# This prevents initializing all 59 exchanges at startup, which was causing stalling
+class LazyExchangeDict(dict):
+    """
+    Dictionary that initializes exchanges lazily on access.
+    Only initializes exchanges when they're actually used, not all 59 at startup.
+    This fixes the stalling issue where the bot tried to initialize all exchanges.
+    """
+    def __getitem__(self, exchange_name: str):
+        if exchange_name not in self:
+            # Only initialize if the exchange is in our configured list
+            if exchange_name not in exchanges:
+                raise KeyError(f"Exchange {exchange_name} is not in the configured exchanges list")
+            
+            merged_config = {**default_config, **exchanges[exchange_name]}
+            try:
+                # Initialize the exchange instance
+                self[exchange_name] = getattr(ccxt, exchange_name)(merged_config)
+            except Exception as e:
+                error_msg = f"Error initializing exchange {exchange_name}: {type(e).__name__}: {e}"
+                print(error_msg)
+                import traceback
+                traceback.print_exc()
+                raise
+        
+        return super().__getitem__(exchange_name)
     
-    # Add SSL verification setting if disabled
-    if DISABLE_SSL_VERIFY:
-        default_config['verify'] = False
-        # Also configure requests to not verify SSL
-        import ssl
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    
-    # Merge default config with exchange-specific config
-    ex = {}
-    for name, config in exchanges.items():
-        merged_config = {**default_config, **config}
+    def get(self, exchange_name: str, default=None):
+        """Get exchange instance, returning default if not found."""
         try:
-            ex[name] = getattr(ccxt, name)(merged_config)
-        except Exception as e:
-            print(f"Error initializing exchange {name}: {type(e).__name__}: {e}")
-            import traceback
-            traceback.print_exc()
-except Exception as e:
-    print(f"Error initializing exchanges: {type(e).__name__}: {e}")
-    import traceback
-    traceback.print_exc()
-    ex = {}
+            return self[exchange_name]
+        except (KeyError, ValueError):
+            return default
+    
+    def keys(self):
+        """Return keys of initialized exchanges only."""
+        return super().keys()
+    
+    def __contains__(self, exchange_name: str):
+        """Check if exchange is initialized (not if it's configured)."""
+        return super().__contains__(exchange_name)
+
+# Global exchange dictionary - now uses lazy initialization
+# Only exchanges that are actually used will be initialized
+ex = LazyExchangeDict()
+
+def get_exchange_instance(exchange_name: str):
+    """
+    Get or create an exchange instance lazily.
+    Only initializes exchanges when they're actually needed.
+    This prevents initializing all 59 exchanges at startup.
+    """
+    return ex[exchange_name]
+
+# Initialize exchanges that are explicitly requested at startup (if any)
+# This allows pre-initialization for commonly used exchanges if needed
+# For now, we'll keep it empty and initialize on-demand
 
 # Legacy compatibility (for existing code that uses old function name)
 moy = calculate_average
